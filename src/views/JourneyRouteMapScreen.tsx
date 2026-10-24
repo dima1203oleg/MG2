@@ -1,0 +1,1116 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  ArrowLeft, ArrowRight, Car, CheckCircle2, ChevronDown, ChevronUp, Clock3, Heart, Layers, MessageCircle, Moon, Navigation, Phone, Share2, Sparkles, Star, Sun,
+} from 'lucide-react';
+import { MarshGoMap } from '../map/MarshGoMap';
+import { buildJourneyRouteMapModel, journeyModeColor } from '../map/journeyRouteModel';
+import type { MapAdapter, MapStatus, RouteFitPadding } from '../map/MapAdapter';
+import { getMapLayer, mapLayers, setMapLayer, type MapLayer } from '../map/mapMode';
+import { productionApi, type ApiJourney, type ApiJourneyLive, type ApiRendezvous, type ApiRendezvousApproaches, type ApiTransitStopArrival, type ApiTransitStopArrivalsMeta } from '../services/productionApi';
+import { journeyLegCanBeBooked } from '../domain/journeyBooking';
+import { matchingStopArrivals, stopArrivalEtaLabel, stopArrivalFreshnessNotice } from '../domain/stopArrivals';
+import { TransportIcon } from '../design-system/transport/TransportIcon';
+import { CanonicalRouteLip } from '../design-system/journey/CanonicalRouteLip';
+import type { JourneySegmentStripItem } from '../design-system/journey/JourneySegmentStrip';
+import { routeBearingForHorizontalFit } from '../map/routeOrientation';
+import { journeyLegCaveat, journeyLegLabel } from './journeyLegLabel';
+import { formatJourneyLegPrice, formatJourneyTotalPrice } from './journeyResultPresentation';
+import { routeSheetHeights, settleRouteSheetSnap, type RouteSheetSnap } from './routeSheet';
+import { themeService } from '../services/theme';
+import { liveRendezvousOverlay } from '../domain/rendezvousMapPoints';
+
+type JourneyLeg = ApiJourney['legs'][number];
+type TimelineItem = {
+  id: string;
+  targetLegId: string;
+  kind: 'LEG' | 'WAIT';
+  durationSeconds: number;
+  color: string;
+  leg?: JourneyLeg;
+};
+
+const formatTime = (value?: string) => {
+  if (!value || !Number.isFinite(Date.parse(value))) return '—';
+  return new Intl.DateTimeFormat('uk-UA', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Kyiv' }).format(new Date(value));
+};
+
+type RendezvousSnapshot = { status: 'loading' | 'unavailable' } | { status: 'available'; session: ApiRendezvous };
+type RendezvousApproachSnapshot = { status: 'loading' | 'unavailable' } | { status: 'available'; value: ApiRendezvousApproaches };
+type StopArrivalsSnapshot = { status: 'loading' } | { status: 'unavailable'; reason?: 'direction_missing' | 'request_failed' } | { status: 'available'; arrivals: ApiTransitStopArrival[]; meta?: ApiTransitStopArrivalsMeta };
+const terminalRendezvousStates = new Set(['CANCELLED', 'EXPIRED', 'COMPLETED']);
+
+const formatDuration = (seconds: number) => {
+  const minutes = Math.max(0, Math.round(seconds / 60));
+  const hours = Math.floor(minutes / 60);
+  return hours ? `${hours} год ${minutes % 60} хв` : `${minutes} хв`;
+};
+
+function formatRoadDistance(meters: number) {
+  return meters >= 1000 ? `${(meters / 1000).toFixed(1).replace('.', ',')} км` : `${Math.round(meters / 50) * 50} м`;
+}
+
+function routeEndpointPresentation(value: string | undefined, fallback: string) {
+  const full = value?.trim() || fallback;
+  const parts = full.split(',').map(part => part.trim()).filter(Boolean);
+  const streetIndex = parts.findIndex(part => /(вулиця|вул\.?|проспект|просп\.?|площа|пл\.?|провулок|пров\.?)/i.test(part));
+  const street = streetIndex >= 0
+    ? parts[streetIndex].replace(/\s+(?:вулиця|вул\.|проспект|просп\.|площа|пл\.|провулок|пров\.)$/i, '').trim()
+    : '';
+  const houseNumber = streetIndex >= 0
+    ? [parts[streetIndex - 1], parts[streetIndex + 1]].find(part => Boolean(part && /^(?:№\s*)?\d+[а-яa-z]?(?:[-/]\d+[а-яa-z]?)?$/i.test(part)))
+    : undefined;
+  const administrative = /(район|област|громад|україна|\b\d{5}\b)/i;
+  const context = parts.find((part, index) => index > Math.max(streetIndex, 0) && part !== houseNumber && !administrative.test(part));
+
+  return {
+    full,
+    primary: street ? `${street}${houseNumber ? `, ${houseNumber.replace(/^№\s*/, '')}` : ''}` : parts[0] || fallback,
+    context,
+  };
+}
+
+function timelineFor(journey: ApiJourney): TimelineItem[] {
+  const legs = journey.legs;
+  const items: TimelineItem[] = [];
+  let cursor = journey.requestedDepartureAt && Number.isFinite(Date.parse(journey.requestedDepartureAt))
+    ? Date.parse(journey.requestedDepartureAt)
+    : legs[0] ? Date.parse(legs[0].departureAt) : 0;
+  for (const leg of legs) {
+    const departure = Date.parse(leg.departureAt);
+    const arrival = Date.parse(leg.arrivalAt);
+    const waitSeconds = Number.isFinite(departure) && cursor > 0 ? Math.max(0, Math.round((departure - cursor) / 1000)) : 0;
+    if (waitSeconds >= 60) items.push({ id: `wait:${leg.id}`, targetLegId: leg.id, kind: 'WAIT', durationSeconds: waitSeconds, color: '#74879A' });
+    const timestampDuration = Number.isFinite(departure) && Number.isFinite(arrival) ? Math.max(0, Math.round((arrival - departure) / 1000)) : 0;
+    const durationSeconds = timestampDuration || Math.max(0, leg.durationSeconds);
+    items.push({ id: `leg:${leg.id}`, targetLegId: leg.id, kind: 'LEG', durationSeconds, color: journeyModeColor(leg.mode, leg.transportType), leg });
+    if (Number.isFinite(arrival)) cursor = arrival;
+  }
+  return items.filter(item => item.durationSeconds > 0);
+}
+
+function isScheduledRouteLeg(leg: JourneyLeg) {
+  return ['BUS', 'MINIBUS', 'TROLLEYBUS', 'TRAM', 'METRO', 'RAIL', 'FERRY', 'FUNICULAR'].includes(leg.mode)
+    || ['bus', 'marshrutka', 'intercity_bus', 'train', 'suburban_train', 'city_train', 'tram', 'trolleybus', 'metro'].includes(leg.transportType ?? '');
+}
+
+function legPriceLabel(leg: JourneyLeg) {
+  const fare = formatJourneyLegPrice(leg, leg.currency ?? 'UAH');
+  return `${fare}${leg.mode === 'COMMUNITY' && fare !== '—' ? ' / місце' : ''}`;
+}
+
+function SegmentIcon({ leg }: { leg: JourneyLeg }) {
+  return <TransportIcon mode={leg.mode} transportType={leg.transportType} size={20} strokeWidth={2.2}/>;
+}
+
+function stopTime(stop: NonNullable<JourneyLeg['stops']>[number], index: number, lastIndex: number) {
+  return formatTime(index === 0 ? stop.departureAt : index === lastIndex ? stop.arrivalAt : stop.arrivalAt);
+}
+
+function RendezvousStatus({ snapshot, approach, isSelected, isDark }: { snapshot?: RendezvousSnapshot; approach?: RendezvousApproachSnapshot; isSelected: boolean; isDark: boolean }) {
+  let message = 'Завантажуємо стан GPS бронювання…';
+  let detail = 'Позиція доступна лише учасникам підтвердженої поїздки.';
+  let stale = false;
+  if (snapshot?.status === 'unavailable') {
+    message = 'Онлайн-стан зустрічі тимчасово недоступний.';
+    detail = 'Збережений маршрут і бронювання залишаються доступними.';
+  } else if (snapshot?.status === 'available') {
+    const session = snapshot.session;
+    if (terminalRendezvousStates.has(session.state)) {
+      message = session.state === 'CANCELLED' ? 'Обмін місцем завершено.' : session.state === 'EXPIRED' ? 'Час онлайн-зустрічі минув.' : 'Зустріч завершена.';
+      detail = 'Поточне відстеження вимкнено.';
+    } else if (!session.locationSharingEnabled) {
+      message = 'Обмін місцем ще не ввімкнено для зустрічі.';
+      detail = 'Точні координати не показуються.';
+    } else {
+      const driver = session.locations.driver;
+      const passenger = session.locations.passenger;
+      stale = (driver?.freshness !== 'LIVE' || passenger?.freshness !== 'LIVE');
+      message = stale ? 'Очікуємо свіжі GPS-позиції обох учасників.' : 'GPS водія й пасажира оновлюється для зустрічі.';
+      const values = approach?.status === 'available' ? approach.value : null;
+      const driverRoute = values?.driver.approach.status === 'ROUTED'
+        && Number.isFinite(values.driver.approach.durationSeconds) && Number.isFinite(values.driver.approach.distanceMeters)
+        ? values.driver.approach : null;
+      const passengerRoute = values?.passenger.approach.status === 'ROUTED'
+        && Number.isFinite(values.passenger.approach.durationSeconds) && Number.isFinite(values.passenger.approach.distanceMeters)
+        ? values.passenger.approach : null;
+      const details = [
+        driverRoute ? `Водій: ${formatDuration(driverRoute.durationSeconds!)} · ${formatRoadDistance(driverRoute.distanceMeters!)}` : 'Водій: маршрут до посадки недоступний',
+        passengerRoute ? `Ви: ${formatDuration(passengerRoute.durationSeconds!)} · ${formatRoadDistance(passengerRoute.distanceMeters!)}` : 'Ви: пішохідний підхід недоступний',
+      ];
+      detail = `${details.join(' · ')}${isSelected ? '' : ' Виберіть сегмент «Попутка», щоб побачити обидва підходи на карті.'}`;
+    }
+  }
+  return <div data-testid="journey-rendezvous-status" role="status" className={`border-t border-[var(--route-border)] px-3 py-2 ${isDark ? 'text-slate-300' : 'text-slate-600'}`}>
+    <b className={`block text-[10px] ${stale ? (isDark ? 'text-amber-200' : 'text-amber-800') : ''}`}>{message}</b>
+    <span className="mt-0.5 block text-[9px] leading-4 text-[var(--route-subtle)]">{detail}</span>
+  </div>;
+}
+
+export function JourneyRouteMapScreen({
+  journey,
+  onBack,
+  onBookOffer,
+  onNavigate,
+}: {
+  journey: ApiJourney;
+  onBack: () => void;
+  onBookOffer?: (offerId: string, journeyId: string, journeyLegId: string) => void;
+  onNavigate?: (destination: { label: string; latitude: number; longitude: number }) => void;
+}) {
+  const model = useMemo(() => buildJourneyRouteMapModel(journey.legs), [journey.legs]);
+  const timeline = useMemo(() => timelineFor(journey), [journey]);
+  const firstLeg = journey.legs[0];
+  const lastLeg = journey.legs.at(-1);
+  const originPresentation = routeEndpointPresentation(journey.origin?.name ?? firstLeg?.origin.name, 'Початок');
+  const destinationPresentation = routeEndpointPresentation(journey.destination?.name ?? lastLeg?.destination.name, 'Кінець');
+  const [mapStatus, setMapStatus] = useState<MapStatus>('loading');
+  const [isDark, setIsDark] = useState(themeService.isDark());
+  const [mapLayer, setCurrentMapLayer] = useState<MapLayer>(getMapLayer);
+  const [sheetSnap, setSheetSnap] = useState<RouteSheetSnap>('half');
+  const [sheetHeight, setSheetHeight] = useState(() => typeof window === 'undefined' ? 560 : routeSheetHeights(window.innerHeight).half);
+  const [viewportHeight, setViewportHeight] = useState(() => typeof window === 'undefined' ? 844 : window.innerHeight);
+  const [dragging, setDragging] = useState(false);
+  const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
+  const [liveJourney, setLiveJourney] = useState<ApiJourneyLive | null>(null);
+  const [stopArrivalsByLegId, setStopArrivalsByLegId] = useState<Record<string, StopArrivalsSnapshot>>({});
+  const [rendezvousByLegId, setRendezvousByLegId] = useState<Record<string, RendezvousSnapshot>>({});
+  const [approachByLegId, setApproachByLegId] = useState<Record<string, RendezvousApproachSnapshot>>({});
+  const [mapAdapterReady, setMapAdapterReady] = useState(false);
+  const [expandedSegments, setExpandedSegments] = useState<Set<string>>(() => new Set());
+  const [saved, setSaved] = useState(() => {
+    try { return (JSON.parse(window.localStorage.getItem('marshgo.saved-route-results.v1') ?? '[]') as unknown[]).includes(journey.id); }
+    catch { return false; }
+  });
+  const [feedback, setFeedback] = useState('');
+  const sheetElement = useRef<HTMLElement | null>(null);
+  const sheetHeightRef = useRef(sheetHeight);
+  const mapAdapter = useRef<MapAdapter | null>(null);
+  const lastRideshareFocusKey = useRef('');
+  const segmentCards = useRef(new Map<string, HTMLElement>());
+  const dragStart = useRef<{ y: number; height: number; snap: RouteSheetSnap; pointerId: number; moved: boolean; lastY: number; lastAt: number; velocity: number } | null>(null);
+  const suppressHandleClick = useRef(false);
+
+  useEffect(() => themeService.subscribe((_theme, dark) => setIsDark(dark)), []);
+
+  useEffect(() => {
+    if (!journey.legs.some(isScheduledRouteLeg)) { setLiveJourney(null); return; }
+    const selectedTransitLeg = journey.legs.find(leg => leg.id === activeSegmentId && isScheduledRouteLeg(leg));
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const poll = async () => {
+      const now = Date.now();
+      const transitLegs = journey.legs.filter(isScheduledRouteLeg);
+      const inGpsWindow = transitLegs.some(leg => {
+        const departure = Date.parse(leg.departureAt);
+        const arrival = Date.parse(leg.arrivalAt);
+        return Number.isFinite(departure) && Number.isFinite(arrival) && now >= departure - 5 * 60_000 && now <= arrival + 10 * 60_000;
+      });
+      if (!inGpsWindow && !selectedTransitLeg && !['ACTIVE', 'TRANSFER'].includes(journey.state)) {
+        setLiveJourney(null);
+        if (!stopped) timer = window.setTimeout(() => void poll(), 60_000);
+        return;
+      }
+      controller = new AbortController();
+      try {
+        const live = await productionApi.journeyLive(journey.id, controller.signal, selectedTransitLeg?.id);
+        if (!stopped) setLiveJourney(live);
+      } catch {
+        if (!stopped) setLiveJourney(null);
+      } finally {
+        if (!stopped) timer = window.setTimeout(() => void poll(), 15_000);
+      }
+    };
+    void poll();
+    return () => { stopped = true; controller?.abort(); if (timer !== undefined) window.clearTimeout(timer); };
+  }, [activeSegmentId, journey.id, journey.legs, journey.state]);
+
+  useEffect(() => {
+    const leg = journey.legs.find(item => item.id === activeSegmentId && isScheduledRouteLeg(item));
+    const boardingStop = leg?.stops?.[0];
+    if (!leg || !expandedSegments.has(leg.id) || !leg.providerId || !leg.routeId || !boardingStop) return;
+    if (!leg.headsign?.trim()) {
+      setStopArrivalsByLegId(current => ({ ...current, [leg.id]: { status: 'unavailable', reason: 'direction_missing' } }));
+      return;
+    }
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    setStopArrivalsByLegId(current => ({ ...current, [leg.id]: { status: 'loading' } }));
+    const poll = async () => {
+      if (document.visibilityState === 'hidden') {
+        if (!stopped) timer = window.setTimeout(() => void poll(), 60_000);
+        return;
+      }
+      controller = new AbortController();
+      try {
+        const result = await productionApi.transitStopArrivals({
+          providerId: leg.providerId!, stopId: boardingStop.id,
+          latitude: boardingStop.coordinates[1], longitude: boardingStop.coordinates[0],
+          routeId: leg.routeId!, headsign: leg.headsign, limit: 3,
+        }, controller.signal);
+        if (!stopped) setStopArrivalsByLegId(current => ({
+          ...current, [leg.id]: { status: 'available', arrivals: matchingStopArrivals(result.data.arrivals, leg.routeId!, leg.headsign), meta: result.meta },
+        }));
+      } catch {
+        if (!stopped) setStopArrivalsByLegId(current => ({ ...current, [leg.id]: { status: 'unavailable', reason: 'request_failed' } }));
+      } finally {
+        if (!stopped) timer = window.setTimeout(() => void poll(), 15_000);
+      }
+    };
+    void poll();
+    return () => { stopped = true; controller?.abort(); if (timer !== undefined) window.clearTimeout(timer); };
+  }, [activeSegmentId, expandedSegments, journey.legs]);
+
+  useEffect(() => {
+    const communityLegs = journey.legs.filter((leg) => leg.mode === 'COMMUNITY');
+    if (!communityLegs.length) { setRendezvousByLegId({}); return; }
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const poll = async () => {
+      if (document.visibilityState === 'hidden') {
+        if (!stopped) timer = window.setTimeout(() => void poll(), 60_000);
+        return;
+      }
+      controller = new AbortController();
+      const bookings = [...new Set(communityLegs.map((leg) => leg.bookingId ?? leg.offerId ?? 'booking-demo-1'))];
+      const snapshots: Array<[string, RendezvousSnapshot]> = await Promise.all(bookings.map(async (bookingId) => {
+        try { return [bookingId, { status: 'available', session: await productionApi.bookingRendezvous(bookingId, controller?.signal) } as RendezvousSnapshot]; }
+        catch { return [bookingId, { status: 'unavailable' } as RendezvousSnapshot]; }
+      }));
+      if (stopped) return;
+      const byBooking = new Map(snapshots);
+      const next = Object.fromEntries(communityLegs.flatMap((leg) => {
+        const key = leg.bookingId ?? leg.offerId ?? 'booking-demo-1';
+        const snapshot = byBooking.get(key);
+        return snapshot ? [[leg.id, snapshot]] : [];
+      }));
+      setRendezvousByLegId(next);
+      const hasOpenSession = snapshots.some(([, snapshot]) => snapshot.status !== 'available' || !terminalRendezvousStates.has(snapshot.session.state));
+      if (hasOpenSession && !stopped) timer = window.setTimeout(() => void poll(), 15_000);
+    };
+    void poll();
+    return () => { stopped = true; controller?.abort(); if (timer !== undefined) window.clearTimeout(timer); };
+  }, [journey.id, journey.legs]);
+
+  useEffect(() => {
+    if (!mapAdapterReady) return;
+    const positions = (activeSegmentId ? [] : liveJourney?.segments.filter(segment => segment.status === 'LIVE' && segment.vehicle) ?? [])
+      .flatMap((segment, index) => {
+        const leg = journey.legs.find(item => item.id === segment.legId);
+        if (!segment.vehicle || !leg) return [];
+        return [{
+          id: segment.legId,
+          coordinates: segment.vehicle.coordinates,
+          color: journeyModeColor(leg.mode, leg.transportType),
+          label: segment.vehicle.route || journeyLegLabel(leg.mode, leg.transportType),
+          updatedAt: segment.vehicle.updatedAt,
+          selected: activeSegmentId ? activeSegmentId === segment.legId : index === 0,
+        }];
+      });
+    if (mapAdapter.current?.setLiveTransitPositions) mapAdapter.current.setLiveTransitPositions(positions);
+    else mapAdapter.current?.setLiveTransitPosition?.(positions[0] ?? null);
+  }, [activeSegmentId, journey.legs, liveJourney, mapAdapterReady]);
+
+  useEffect(() => {
+    if (!mapAdapterReady) return;
+    const leg = journey.legs.find(item => item.id === activeSegmentId && isScheduledRouteLeg(item));
+    const segment = liveJourney?.segments.find(item => item.legId === activeSegmentId);
+    if (!leg || !segment) {
+      mapAdapter.current?.setTransitLineOverlay?.(null);
+      return;
+    }
+    const lines = (segment.lineRoutes ?? []).flatMap(line => line.coordinates.length >= 2 ? [{
+      id: line.id,
+      direction: line.direction,
+      coordinates: line.coordinates,
+    }] : []);
+    const vehicles = (segment.vehicles ?? []).map(vehicle => ({
+      id: vehicle.id,
+      coordinates: vehicle.coordinates,
+      updatedAt: vehicle.updatedAt,
+      emphasized: vehicle.emphasized,
+      approachEvidence: vehicle.approachEvidence?.source ?? null,
+      etaSeconds: vehicle.etaSeconds ?? null,
+      remainingStops: vehicle.approachEvidence?.remainingStops ?? null,
+    }));
+    mapAdapter.current?.setTransitLineOverlay?.({
+      modeColor: journeyModeColor(leg.mode, leg.transportType),
+      transportType: leg.transportType ?? leg.mode.toLowerCase(),
+      lines,
+      vehicles,
+    });
+  }, [activeSegmentId, journey.legs, liveJourney, mapAdapterReady]);
+
+  useEffect(() => {
+    if (!mapAdapterReady) return;
+    const selectedLeg = journey.legs.find((leg) => leg.id === activeSegmentId && leg.mode === 'COMMUNITY');
+    if (!selectedLeg) {
+      lastRideshareFocusKey.current = '';
+      mapAdapter.current?.setLiveRidesharePositions?.([]);
+      mapAdapter.current?.setLiveRideshareApproachRoute?.(null);
+      mapAdapter.current?.setLiveRendezvousApproachRoutes?.([]);
+      return;
+    }
+    const snapshot = rendezvousByLegId[selectedLeg.id];
+    if (snapshot?.status !== 'available') {
+      mapAdapter.current?.setLiveRidesharePositions?.([]);
+      mapAdapter.current?.setLiveRideshareApproachRoute?.(null);
+      mapAdapter.current?.setLiveRendezvousApproachRoutes?.([]);
+      return;
+    }
+    const session = snapshot.session;
+    if (!session.locationSharingEnabled || !session.currentParticipantConsent || !session.otherParticipantConsent || terminalRendezvousStates.has(session.state)) {
+      lastRideshareFocusKey.current = '';
+      mapAdapter.current?.setLiveRidesharePositions?.([]);
+      mapAdapter.current?.setLiveRideshareApproachRoute?.(null);
+      mapAdapter.current?.setLiveRendezvousApproachRoutes?.([]);
+      return;
+    }
+    const approachSnapshot = approachByLegId[selectedLeg.id];
+    const overlay = approachSnapshot?.status === 'available' && approachSnapshot.value.rendezvousId === session.id
+      ? liveRendezvousOverlay(approachSnapshot.value)
+      : { positions: [], routes: [] };
+    mapAdapter.current?.setLiveRidesharePositions?.(overlay.positions);
+    mapAdapter.current?.setLiveRideshareApproachRoute?.(null);
+    mapAdapter.current?.setLiveRendezvousApproachRoutes?.(overlay.routes);
+    if (overlay.positions.length) {
+      const focusKey = `${journey.id}:${selectedLeg.id}`;
+      if (lastRideshareFocusKey.current !== focusKey) {
+        lastRideshareFocusKey.current = focusKey;
+        mapAdapter.current?.focusCoordinates?.([...overlay.positions.map((position) => position.coordinates), session.pickup.coordinates], {
+          top: 84, right: 48, bottom: Math.max(180, sheetHeight + 28), left: 32,
+        }, 15);
+      }
+    } else lastRideshareFocusKey.current = '';
+  }, [activeSegmentId, approachByLegId, journey.id, journey.legs, mapAdapterReady, rendezvousByLegId, sheetHeight]);
+
+  useEffect(() => {
+    if (!mapAdapterReady) return;
+    const selectedLeg = journey.legs.find((leg) => leg.id === activeSegmentId && leg.mode === 'COMMUNITY');
+    if (!selectedLeg) return;
+    const snapshot = rendezvousByLegId[selectedLeg.id];
+    if (snapshot?.status !== 'available') return;
+    const session = snapshot.session;
+    if (!session.locationSharingEnabled || !session.currentParticipantConsent || !session.otherParticipantConsent || terminalRendezvousStates.has(session.state)) {
+      setApproachByLegId((current) => ({ ...current, [selectedLeg.id]: { status: 'unavailable' } }));
+      return;
+    }
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const legId = selectedLeg.id;
+    const poll = async () => {
+      if (document.visibilityState === 'hidden') {
+        if (!stopped) timer = window.setTimeout(() => void poll(), 30_000);
+        return;
+      }
+      controller = new AbortController();
+      try {
+        const value = await productionApi.rendezvousApproaches(session.id, controller.signal);
+        if (!stopped && value.rendezvousId === session.id) setApproachByLegId((current) => ({ ...current, [legId]: { status: 'available', value } }));
+      } catch {
+        if (!stopped && !controller.signal.aborted) setApproachByLegId((current) => ({ ...current, [legId]: { status: 'unavailable' } }));
+      } finally {
+        if (!stopped) timer = window.setTimeout(() => void poll(), 15_000);
+      }
+    };
+    setApproachByLegId((current) => ({ ...current, [legId]: current[legId] ?? { status: 'loading' } }));
+    void poll();
+    return () => { stopped = true; controller?.abort(); if (timer !== undefined) window.clearTimeout(timer); };
+  }, [activeSegmentId, journey.legs, mapAdapterReady, rendezvousByLegId]);
+
+  const snapHeight = useCallback((snap: RouteSheetSnap, viewport = viewportHeight) => routeSheetHeights(viewport)[snap], [viewportHeight]);
+
+  useEffect(() => {
+    const updateViewport = () => {
+      const next = window.innerHeight;
+      setViewportHeight(next);
+      const nextHeight = snapHeight(sheetSnap, next);
+      sheetHeightRef.current = nextHeight;
+      setSheetHeight(nextHeight);
+    };
+    window.addEventListener('resize', updateViewport);
+    return () => window.removeEventListener('resize', updateViewport);
+  }, [sheetSnap, snapHeight]);
+
+  const routeBearing = useMemo(() => {
+    if (sheetSnap !== 'expanded') return 0;
+    if (activeSegmentId) {
+      const selected = model.routeSegments.find(segment => segment.id === activeSegmentId);
+      if (selected?.coordinates.length) return routeBearingForHorizontalFit(selected.coordinates);
+      const leg = journey.legs.find(item => item.id === activeSegmentId);
+      const coordinates = [leg?.origin.coordinates, ...(leg?.stops?.map(stop => stop.coordinates) ?? []), leg?.destination.coordinates]
+        .filter((point): point is [number, number] => Boolean(point && point.length === 2 && point.every(Number.isFinite)));
+      return routeBearingForHorizontalFit(coordinates);
+    }
+    return routeBearingForHorizontalFit(model.routeWaypoints.map(point => point.coordinate));
+  }, [activeSegmentId, journey.legs, model.routeSegments, model.routeWaypoints, sheetSnap]);
+
+  const mapPadding = useMemo<RouteFitPadding>(() => ({
+    top: 72,
+    left: 22,
+    right: 22,
+    // The sheet overlays a full-screen map. Reserve its complete height so
+    // the route fits in the visible map area above it, including at half and
+    // expanded snap points.
+    bottom: sheetHeight + 8,
+    bearing: routeBearing,
+  }), [routeBearing, sheetHeight]);
+
+  const chooseSegment = useCallback((id: string, expandForDetails = true) => {
+    const leg = journey.legs.find(item => item.id === id);
+    if (!leg) return;
+    setActiveSegmentId(id);
+    if (sheetSnap === 'collapsed' || sheetSnap === 'minimized') {
+      setSheetSnap('half');
+      const nextHeight = snapHeight('half');
+      sheetHeightRef.current = nextHeight;
+      setSheetHeight(nextHeight);
+    }
+    if (expandForDetails && isScheduledRouteLeg(leg)) {
+      setExpandedSegments(current => new Set(current).add(id));
+    }
+    requestAnimationFrame(() => segmentCards.current.get(id)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
+  }, [journey.legs, sheetSnap, snapHeight]);
+
+  useEffect(() => {
+    if (dragging) return;
+    if (!activeSegmentId) {
+      mapAdapter.current?.setActiveRouteSegment?.(null);
+      mapAdapter.current?.fitRoute(mapPadding);
+      return;
+    }
+    mapAdapter.current?.setActiveRouteSegment?.(activeSegmentId);
+    const focused = mapAdapter.current?.focusRouteSegment?.(activeSegmentId, mapPadding) ?? false;
+    if (focused) return;
+    const leg = journey.legs.find(item => item.id === activeSegmentId);
+    const points = [leg?.origin.coordinates, ...(leg?.stops?.map(stop => stop.coordinates) ?? []), leg?.destination.coordinates]
+      .filter((point): point is [number, number] => Boolean(point && point.length === 2 && point.every(Number.isFinite)));
+    if (points.length) mapAdapter.current?.focusCoordinates?.(points, mapPadding, leg?.mode === 'RAIL' ? 10 : 14);
+    else mapAdapter.current?.fitRoute(mapPadding);
+  }, [activeSegmentId, dragging, journey.legs, mapPadding]);
+
+  useEffect(() => {
+    if (sheetSnap === 'expanded') setExpandedSegments(new Set(journey.legs.filter(isScheduledRouteLeg).map(leg => leg.id)));
+  }, [sheetSnap, journey.legs]);
+
+  const hasMeasuredDistance = (leg: JourneyLeg): leg is JourneyLeg & { distanceMeters: number } => typeof leg.distanceMeters === 'number'
+    && Number.isFinite(leg.distanceMeters) && leg.distanceMeters >= 0;
+  const knownDistance = journey.legs.reduce((sum, leg) => sum + (hasMeasuredDistance(leg) ? leg.distanceMeters : 0), 0);
+  const completeDistance = journey.legs.length > 0 && journey.legs.every(hasMeasuredDistance);
+  const distanceSummary = completeDistance
+    ? `${(knownDistance / 1000).toLocaleString('uk-UA', { maximumFractionDigits: 1 })} км`
+    : knownDistance > 0 ? `Відомо ${(knownDistance / 1000).toLocaleString('uk-UA', { maximumFractionDigits: 1 })} км`
+      : 'Відстань не вказана';
+  const stripItems: JourneySegmentStripItem[] = timeline.flatMap(item => {
+    if (item.kind !== 'LEG' || !item.leg) return [];
+    const leg = item.leg;
+    return [{
+      id: leg.id,
+      mode: leg.mode,
+      transportType: leg.transportType,
+      label: leg.mode === 'COMMUNITY' ? 'Попутка' : journeyLegLabel(leg.mode, leg.transportType),
+      selectionLabel: (leg.mode === 'COMMUNITY' ? 'Попутка' : journeyLegLabel(leg.mode, leg.transportType)) + (leg.routeName ? ' ' + leg.routeName : ''),
+      accessibilityLabel: (leg.mode === 'COMMUNITY' ? 'Попутка' : journeyLegLabel(leg.mode, leg.transportType)) + (leg.routeName ? ', маршрут ' + leg.routeName : '') + ', ' + formatDuration(item.durationSeconds) + ', ' + legPriceLabel(leg),
+      durationSeconds: item.durationSeconds,
+      durationLabel: formatDuration(item.durationSeconds),
+      priceLabel: legPriceLabel(leg),
+      color: item.color,
+    }];
+  });
+  const waitingSeconds = timeline.filter(item => item.kind === 'WAIT').reduce((sum, item) => sum + item.durationSeconds, 0);
+  const missingShapes = model.missingShapeCount;
+  const approximateWalkCount = model.approximateWalkCount;
+  const mapStatusText = mapStatus === 'failed' ? 'Карта недоступна' : mapStatus === 'degraded' ? 'Карта завантажена частково'
+    : mapStatus === 'unconfigured' ? 'Потрібне налаштування карти' : missingShapes > 0 ? 'Є сегменти без геометрії джерела'
+      : approximateWalkCount > 0 ? 'Пунктиром позначені орієнтовні піші відрізки' : 'Маршрут на карті';
+
+  const heightForSnap = (snap: RouteSheetSnap) => snapHeight(snap);
+  const moveToSnap = (next: RouteSheetSnap) => {
+    const nextHeight = heightForSnap(next);
+    sheetHeightRef.current = nextHeight;
+    setSheetSnap(next);
+    setSheetHeight(nextHeight);
+    if (sheetElement.current) {
+      sheetElement.current.style.transition = 'height 380ms cubic-bezier(0.16, 1, 0.3, 1)';
+      sheetElement.current.style.height = `${nextHeight}px`;
+    }
+  };
+  const cycleSheet = () => {
+    if (suppressHandleClick.current) { suppressHandleClick.current = false; return; }
+    const next: RouteSheetSnap = sheetSnap === 'minimized'
+      ? 'half'
+      : sheetSnap === 'collapsed'
+        ? 'half'
+        : sheetSnap === 'half'
+          ? 'expanded'
+          : 'minimized';
+    moveToSnap(next);
+  };
+  const handlePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
+    const now = performance.now();
+    const renderedHeight = sheetElement.current?.getBoundingClientRect().height ?? sheetHeightRef.current;
+    sheetHeightRef.current = renderedHeight;
+    setSheetHeight(renderedHeight);
+    if (sheetElement.current) {
+      sheetElement.current.style.transition = 'none';
+      sheetElement.current.style.height = `${renderedHeight}px`;
+    }
+    dragStart.current = { y: event.clientY, height: renderedHeight, snap: sheetSnap, pointerId: event.pointerId, moved: false, lastY: event.clientY, lastAt: now, velocity: 0 };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDragging(true);
+  };
+  const handlePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
+    const start = dragStart.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    const delta = start.y - event.clientY;
+    if (Math.abs(delta) > 4) start.moved = true;
+    if (!start.moved) return;
+    suppressHandleClick.current = true;
+    const now = performance.now();
+    const elapsed = Math.max(1, now - start.lastAt);
+    start.velocity = (start.lastY - event.clientY) / elapsed;
+    start.lastY = event.clientY;
+    start.lastAt = now;
+    const heights = routeSheetHeights(viewportHeight);
+    const nextHeight = Math.min(heights.expanded + 20, Math.max(heights.minimized - 10, start.height + delta));
+    sheetHeightRef.current = nextHeight;
+    if (sheetElement.current) {
+      sheetElement.current.style.transition = 'none';
+      sheetElement.current.style.height = `${nextHeight}px`;
+    }
+  };
+  const handlePointerEnd = (event: ReactPointerEvent<HTMLElement>) => {
+    const start = dragStart.current;
+    if (!start || start.pointerId !== event.pointerId) return;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { }
+    }
+    if (sheetElement.current) {
+      sheetElement.current.style.transition = 'height 380ms cubic-bezier(0.16, 1, 0.3, 1)';
+    }
+    if (start.moved) {
+      const heights = routeSheetHeights(viewportHeight);
+      const next = settleRouteSheetSnap(sheetHeightRef.current, start.velocity, heights, start.snap);
+      moveToSnap(next);
+    } else if (sheetElement.current) {
+      sheetElement.current.style.transition = '';
+    }
+    dragStart.current = null;
+    setDragging(false);
+  };
+
+  const setCardRef = (id: string, node: HTMLElement | null) => {
+    if (node) segmentCards.current.set(id, node); else segmentCards.current.delete(id);
+  };
+  const toggleExpanded = (id: string) => setExpandedSegments(current => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+
+  const toggleSaved = (nextSaved = !saved) => {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem('marshgo.saved-route-results.v1') ?? '[]') as unknown;
+      const ids = Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+      const nextIds = nextSaved ? [...new Set([...ids, journey.id])] : ids.filter(id => id !== journey.id);
+      window.localStorage.setItem('marshgo.saved-route-results.v1', JSON.stringify(nextIds));
+      setSaved(nextSaved);
+      setFeedback(nextSaved ? 'Маршрут збережено на цьому пристрої.' : 'Маршрут видалено зі збережених.');
+    } catch {
+      setFeedback('Не вдалося зберегти маршрут на цьому пристрої.');
+    }
+  };
+
+
+  const shareRoute = async () => {
+    const url = `${window.location.origin}${window.location.pathname}${window.location.search}`;
+    try {
+      if (navigator.share) await navigator.share({ title: 'Маршрут MARSHGO', text: `${firstLeg?.origin.name ?? ''} → ${lastLeg?.destination.name ?? ''}`, url });
+      else if (navigator.clipboard) { await navigator.clipboard.writeText(url); setFeedback('Посилання на маршрут скопійовано.'); }
+      else setFeedback('Поділитися можна з меню браузера.');
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      setFeedback('Не вдалося поділитися посиланням. Спробуйте ще раз.');
+    }
+  };
+
+  return <main className="route-map-screen fixed inset-0 z-[75] overflow-hidden text-[var(--route-ink)]" data-theme={isDark ? 'dark' : 'light'} data-route-camera-bearing={routeBearing.toFixed(2)} aria-label="Побудований маршрут">
+    <div className="absolute inset-0" data-testid="journey-route-map">
+      <MarshGoMap
+        route={[]}
+        routeSegments={model.routeSegments}
+        routeWaypoints={model.routeWaypoints}
+        routeFitPadding={mapPadding}
+        theme={isDark ? 'MARSHGO_DARK' : 'MARSHGO_LIGHT'}
+        onStatus={setMapStatus}
+        onAdapter={adapter => { mapAdapter.current = adapter; setMapAdapterReady(Boolean(adapter)); if (adapter) { adapter.setActiveRouteSegment?.(activeSegmentId); } }}
+        activeRouteSegmentId={activeSegmentId}
+        onRouteSegmentSelect={id => chooseSegment(id)}
+      />
+    </div>
+
+    <header className="absolute inset-x-0 top-0 z-10 mx-auto flex max-w-3xl flex-col gap-1.5 px-4 pb-2 pt-[max(.65rem,env(safe-area-inset-top))] pointer-events-none">
+      <div className="flex items-center justify-between gap-2 pointer-events-auto">
+        <button type="button" aria-label="Назад до результатів" onClick={onBack} className="ds-interactive grid h-10 w-10 shrink-0 place-items-center rounded-full border border-[var(--route-border)] bg-[var(--route-floating)] text-[var(--route-ink)] shadow-lg backdrop-blur">
+          <ArrowLeft size={19}/>
+        </button>
+        <div className="no-scrollbar flex flex-1 items-center justify-between gap-2 overflow-x-auto rounded-full border border-[var(--route-border)] bg-[var(--route-floating)] px-3 py-1.5 shadow-lg backdrop-blur" role="toolbar" aria-label="Керування картою маршруту">
+          <div className="flex min-w-0 items-center gap-1.5 text-xs font-extrabold text-[var(--route-ink)]">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-[#0B6EF3]" aria-hidden="true" />
+            <span className="truncate">{originPresentation.primary}</span>
+            <ArrowRight size={13} className="shrink-0 opacity-60" aria-hidden="true" />
+            <span className="h-2 w-2 shrink-0 rounded-full bg-[#EF4444]" aria-hidden="true" />
+            <span className="truncate">{destinationPresentation.primary}</span>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {journey.legs.find(isScheduledRouteLeg) && (
+              <button type="button" onClick={() => {
+                const transitLeg = journey.legs.find((l) => l.mode === 'BUS' || l.mode === 'MINIBUS') ?? journey.legs.find(isScheduledRouteLeg);
+                if (transitLeg) { moveToSnap('half'); chooseSegment(transitLeg.id, true); }
+              }} className={`ds-interactive shrink-0 rounded-full px-2.5 py-1 text-[10px] font-extrabold transition ${activeSegmentId && isScheduledRouteLeg(journey.legs.find(l => l.id === activeSegmentId)!) ? 'bg-[#FF9A32] text-white' : 'bg-amber-500/15 text-amber-600 dark:text-amber-300'}`}>Автобус LIVE</button>
+            )}
+            {journey.legs.find(l => l.mode === 'COMMUNITY') && (
+              <button type="button" onClick={() => {
+                const communityLeg = journey.legs.find((l) => l.mode === 'COMMUNITY');
+                if (communityLeg) { moveToSnap('half'); chooseSegment(communityLeg.id, true); }
+              }} className={`ds-interactive shrink-0 rounded-full px-2.5 py-1 text-[10px] font-extrabold transition ${activeSegmentId && journey.legs.find(l => l.id === activeSegmentId)?.mode === 'COMMUNITY' ? 'bg-[#8845E8] text-white' : 'bg-purple-500/15 text-purple-600 dark:text-purple-300'}`}>Попутка GPS</button>
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-1.5">
+          <button type="button" aria-label={isDark ? 'Увімкнути світлу тему' : 'Увімкнути темну тему'} title="Змінити тему" onClick={() => themeService.setTheme(isDark ? 'light' : 'dark')} className="ds-interactive grid h-10 w-10 place-items-center rounded-full border border-[var(--route-border)] bg-[var(--route-floating)] text-[var(--route-ink)] shadow-lg backdrop-blur">
+            {isDark ? <Sun size={17} className="text-amber-300"/> : <Moon size={17} className="text-slate-700"/>}
+          </button>
+          <button type="button" aria-label="Показати маршрут цілком" title="Показати маршрут цілком" onClick={() => { setActiveSegmentId(null); mapAdapter.current?.fitRoute(mapPadding); }} className="ds-interactive grid h-10 w-10 place-items-center rounded-full border border-[var(--route-border)] bg-[var(--route-floating)] text-[#1687FF] shadow-lg backdrop-blur"><Navigation size={18}/></button>
+          <button type="button" aria-label={`Шар карти: ${mapLayers[mapLayer].label}. Перемкнути`} title={`Шар карти: ${mapLayers[mapLayer].label}`} onClick={() => {
+            const next: MapLayer = mapLayer === 'simple' ? 'satellite' : 'simple';
+            setCurrentMapLayer(next); setMapLayer(next);
+          }} className="ds-interactive grid h-10 w-10 place-items-center rounded-full border border-[var(--route-border)] bg-[var(--route-floating)] text-[var(--route-ink)] shadow-lg backdrop-blur"><Layers size={18}/></button>
+        </div>
+      </div>
+    </header>
+
+    <section
+      ref={sheetElement}
+      className="route-sheet-with-tabbar absolute inset-x-0 bottom-0 z-20 mx-auto flex max-w-3xl flex-col overflow-hidden rounded-t-[1.75rem] border border-[var(--route-border)] bg-[var(--route-sheet)] shadow-[var(--route-sheet-shadow)]"
+      aria-label="Деталі маршруту"
+      data-testid="route-bottom-sheet"
+      data-sheet-state={sheetSnap}
+      style={{
+        height: `${sheetHeight}px`,
+        transition: dragging ? 'none' : 'height 320ms cubic-bezier(.16,1,.3,1)',
+        paddingBottom: sheetSnap === 'minimized' ? '0.25rem' : '0.5rem',
+        background: 'linear-gradient(155deg,var(--route-sheet-start),var(--route-sheet-end))',
+      }}
+    >
+      <button
+        type="button"
+        aria-label={sheetSnap === 'minimized' ? 'Розгорнути деталі маршруту' : sheetSnap === 'expanded' ? 'Згорнути панель повністю' : 'Змінити висоту панелі'}
+        aria-expanded={sheetSnap !== 'minimized' && sheetSnap !== 'collapsed'}
+        onClick={cycleSheet}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerEnd}
+        onPointerCancel={handlePointerEnd}
+        onKeyDown={event => {
+          if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            const next: RouteSheetSnap = sheetSnap === 'minimized' ? 'collapsed' : sheetSnap === 'collapsed' ? 'half' : 'expanded';
+            moveToSnap(next);
+          }
+          if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            const next: RouteSheetSnap = sheetSnap === 'expanded' ? 'half' : sheetSnap === 'half' ? 'collapsed' : 'minimized';
+            moveToSnap(next);
+          }
+          if (event.key === 'Home') { event.preventDefault(); moveToSnap('minimized'); }
+          if (event.key === 'End') { event.preventDefault(); moveToSnap('expanded'); }
+        }}
+        aria-controls="route-segment-list"
+        aria-keyshortcuts="ArrowUp ArrowDown Home End"
+        className="route-sheet-grabber flex h-7 w-full shrink-0 touch-none select-none items-center justify-center pt-1 cursor-grab active:cursor-grabbing"
+      >
+        <span className="h-1.5 w-14 rounded-full bg-[var(--route-grabber)] hover:bg-[#0B6EF3] transition-colors duration-200 shadow-sm" />
+      </button>
+
+      {sheetSnap === 'minimized' ? (
+        <div
+          role="button"
+          tabIndex={0}
+          aria-label="Розгорнути деталі маршруту (натисніть або потягніть вгору)"
+          onClick={() => moveToSnap('half')}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerEnd}
+          onPointerCancel={handlePointerEnd}
+          onKeyDown={event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); moveToSnap('half'); }
+          }}
+          className="flex h-9 items-center justify-between px-3.5 select-none touch-none cursor-pointer"
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <div className="flex min-w-0 items-center gap-1.5 text-xs font-bold text-[var(--route-ink)]">
+              <span className="h-2 w-2 shrink-0 rounded-full bg-[#0B6EF3]" aria-hidden="true" />
+              <span className="truncate max-w-[85px] sm:max-w-[140px]">{originPresentation.primary}</span>
+              <ArrowRight size={11} className="shrink-0 opacity-60 text-[var(--route-muted)]" aria-hidden="true" />
+              <span className="h-2 w-2 shrink-0 rounded-full bg-[#EF4444]" aria-hidden="true" />
+              <span className="truncate max-w-[85px] sm:max-w-[140px]">{destinationPresentation.primary}</span>
+            </div>
+            <span className="shrink-0 text-xs font-black text-[var(--route-ink)]">· {formatDuration(journey.totalDurationSeconds)}</span>
+            <span className="shrink-0 text-xs font-black text-[#E11D48] dark:text-[#F43F5E]">
+              · {journey.confirmedPriceMinor !== null ? `${Math.round(journey.confirmedPriceMinor / 100)} ₴` : journey.totalPriceMinor !== null ? `${Math.round(journey.totalPriceMinor / 100)} ₴` : '—'}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <span className="inline-flex items-center gap-1 rounded-full bg-[#0B6EF3]/10 px-2 py-0.5 text-[10px] font-extrabold text-[#0B6EF3]">
+              <span>Розгорнути</span>
+              <ChevronUp size={13} aria-hidden="true" />
+            </span>
+          </div>
+        </div>
+      ) : (
+        <div
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerEnd}
+          onPointerCancel={handlePointerEnd}
+          className={`route-sheet-summary shrink-0 px-3 pb-2 touch-none select-none${sheetSnap === 'collapsed' ? ' route-sheet-summary--compact' : ''}`}
+        >
+          <div className="px-3 py-1.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="route-summary-eyebrow text-[10px] font-extrabold uppercase tracking-[.12em] text-[#1687FF]">Деталі маршруту</p>
+              <div className="inline-flex items-center gap-0.5 rounded-full border border-[var(--route-border)] bg-[var(--route-card)] p-0.5" role="group" aria-label="Рівень панелі маршруту">
+                {([
+                  ['minimized', 'Згорнути'],
+                  ['collapsed', 'Компакт'],
+                  ['half', 'Середня'],
+                  ['expanded', 'Повна'],
+                ] as const).map(([snapKey, snapLabel]) => (
+                  <button
+                    key={snapKey}
+                    type="button"
+                    onClick={() => moveToSnap(snapKey)}
+                    aria-pressed={sheetSnap === snapKey}
+                    className={`ds-interactive rounded-full px-2 py-0.5 text-[10px] font-extrabold transition ${
+                      sheetSnap === snapKey
+                        ? 'bg-[#0B6EF3] text-white shadow-xs'
+                        : 'text-[var(--route-muted)] hover:text-[var(--route-ink)]'
+                    }`}
+                  >
+                    {snapLabel}
+                  </button>
+                ))}
+              </div>
+            </div>
+          <div className="route-endpoints mt-2" role="group" aria-label={`Звідки: ${originPresentation.full}. Куди: ${destinationPresentation.full}.`}>
+            <div className="route-endpoint" title={originPresentation.full}>
+              <span className="route-endpoint-marker route-endpoint-marker--origin" aria-hidden="true"/>
+              <span className="route-endpoint-copy">
+                <span className="route-endpoint-kicker">ЗВІДКИ</span>
+                <strong className="route-endpoint-name">{originPresentation.primary}</strong>
+                {originPresentation.context && <span className="route-endpoint-context">{originPresentation.context}</span>}
+              </span>
+            </div>
+            <ArrowRight className="route-endpoints-arrow" size={17} aria-hidden="true"/>
+            <div className="route-endpoint route-endpoint--destination" title={destinationPresentation.full}>
+              <span className="route-endpoint-marker route-endpoint-marker--destination" aria-hidden="true"/>
+              <span className="route-endpoint-copy">
+                <span className="route-endpoint-kicker">КУДИ</span>
+                <strong className="route-endpoint-name">{destinationPresentation.primary}</strong>
+                {destinationPresentation.context && <span className="route-endpoint-context">{destinationPresentation.context}</span>}
+              </span>
+            </div>
+          </div>
+          {/* Top Primary Stats Row inspired by user mockup 31E3427E-... & ___________34f701b8.png */}
+          <div className="mt-2.5 flex items-center justify-between gap-3 border-b border-[var(--route-border)] pb-2.5 px-1">
+            <div className="flex items-baseline gap-4">
+              <div className="flex items-baseline gap-1">
+                <span className="text-2xl sm:text-3xl font-black tracking-tight text-[var(--route-ink)]">{formatDuration(journey.totalDurationSeconds)}</span>
+              </div>
+              <div className="flex items-baseline gap-1">
+                <span className="text-2xl sm:text-3xl font-black tracking-tight text-[#E11D48] dark:text-[#F43F5E]">
+                  {journey.confirmedPriceMinor !== null ? `${Math.round(journey.confirmedPriceMinor / 100)} ₴` : journey.totalPriceMinor !== null ? `${Math.round(journey.totalPriceMinor / 100)} ₴` : '—'}
+                </span>
+              </div>
+              <div className="hidden sm:flex items-center gap-1.5 text-xs font-bold text-[var(--route-muted)]">
+                <Clock3 size={14} className="text-[#0B6EF3]"/>
+                <span>{journey.transfers === 0 ? '0 пересадок' : `${journey.transfers} пересадки`}</span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => toggleSaved()}
+                aria-label={saved ? 'Видалити з улюблених' : 'Зберегти маршрут'}
+                className={`grid h-10 w-10 place-items-center rounded-full border border-[var(--route-border)] shadow-sm backdrop-blur transition active:scale-90 ${saved ? 'bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-400' : 'bg-[var(--route-card)] text-[var(--route-muted)]'}`}
+              >
+                <Heart size={18} fill={saved ? 'currentColor' : 'none'}/>
+              </button>
+              {lastLeg && onNavigate && (
+                <button
+                  type="button"
+                  onClick={() => onNavigate({ label: lastLeg.destination.name, latitude: lastLeg.destination.coordinates[1], longitude: lastLeg.destination.coordinates[0] })}
+                  aria-label="Почати ведення"
+                  title="Почати навігацію маршрутом"
+                  className="grid h-10 w-10 place-items-center rounded-full bg-[#0B6EF3] text-white shadow-md shadow-blue-500/25 transition active:scale-90"
+                >
+                  <Navigation size={17} fill="currentColor"/>
+                </button>
+              )}
+            </div>
+          </div>
+          <CanonicalRouteLip
+            journeyId={journey.id}
+            totalDurationSeconds={journey.totalDurationSeconds}
+            totalPriceMinor={journey.confirmedPriceMinor ?? journey.totalPriceMinor}
+            currency={journey.currency}
+            priceStatus={journey.confirmedPriceMinor !== null ? 'LOCKED' : journey.priceStatus}
+            hasUnknownPrice={formatJourneyTotalPrice(journey) === '—'}
+            transferCount={journey.transfers}
+            strategy={journey.strategy}
+            segments={stripItems}
+            selectedSegmentId={activeSegmentId}
+            favorite={saved}
+            availabilityStatus={journey.state}
+            actionLabel={sheetSnap === 'expanded' ? 'Згорнути панель до карти' : sheetSnap === 'half' ? 'Розгорнути панель повністю' : 'Показати деталі маршруту'}
+            actionExpanded={sheetSnap !== 'collapsed'}
+            onSegmentSelect={chooseSegment}
+            onOpenDetails={cycleSheet}
+            onFavoriteChange={toggleSaved}
+          />
+          <div className="mt-1 flex items-center justify-between gap-2">
+            <p className="text-[9px] font-semibold text-[var(--route-muted)]">{distanceSummary}{waitingSeconds > 0 ? ' · очікування ' + formatDuration(waitingSeconds) : ''}</p>
+            {activeSegmentId && <button type="button" onClick={() => setActiveSegmentId(null)} className="min-h-9 rounded-full border border-[var(--route-border)] px-3 text-[10px] font-bold text-[#1687FF] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1687FF]">Показати весь маршрут</button>}
+          </div>
+          {(mapStatus === 'failed' || mapStatus === 'degraded' || mapStatus === 'unconfigured' || missingShapes > 0 || approximateWalkCount > 0) && <p role="status" className={`mt-1 text-[9px] font-semibold ${isDark ? 'text-amber-200' : 'text-amber-800'}`}>{mapStatusText}</p>}
+          {!stripItems.length && <p className="mt-2 text-xs text-[var(--route-muted)]">Дані сегментів цього маршруту не надійшли.</p>}
+          <span className="sr-only">Загальна відстань: {distanceSummary}. Виїзд {firstLeg ? formatTime(firstLeg.departureAt) : '—'}, прибуття {lastLeg ? formatTime(lastLeg.arrivalAt) : '—'}. Кольорова смуга пропорційна тривалості транспортних сегментів; очікування показане окремо.</span>
+        </div>
+      </div>
+    )}
+
+    {(sheetSnap === 'half' || sheetSnap === 'expanded') && <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 pb-3" data-testid="route-segment-list">
+        <ol className="space-y-2">
+          {timeline.map(item => {
+            if (item.kind === 'WAIT') return <li key={item.id} className="rounded-xl border border-[var(--route-border)] bg-[var(--route-card-alt)] px-3 py-2 text-xs text-[var(--route-muted)]">
+              <span className="inline-flex items-center gap-2"><Clock3 size={14} className="text-[var(--route-subtle)]"/>Очікування · {formatDuration(item.durationSeconds)}</span>
+            </li>;
+            const leg = item.leg!;
+            const color = item.color;
+            const selected = activeSegmentId === leg.id;
+            const scheduled = isScheduledRouteLeg(leg);
+            const liveSegment = liveJourney?.segments.find(segment => segment.legId === leg.id);
+            const liveStatus = liveSegment?.status === 'LIVE' ? 'LIVE' : leg.liveStatus;
+            const expanded = expandedSegments.has(leg.id);
+            const caveat = journeyLegCaveat(leg.mode, leg.source, leg.scheduleSemantics, leg.fareSource);
+            const canBook = journeyLegCanBeBooked(leg);
+            const stops = leg.stops ?? [];
+            const arrivalsSnapshot = stopArrivalsByLegId[leg.id];
+            const arrivalNotice = arrivalsSnapshot?.status === 'available' ? stopArrivalFreshnessNotice(arrivalsSnapshot.meta) : null;
+            const arrivalNoticeColor = arrivalNotice?.tone === 'live'
+              ? (isDark ? 'text-emerald-300' : 'text-emerald-800')
+              : arrivalNotice?.tone === 'warning'
+                ? (isDark ? 'text-amber-200' : 'text-amber-800')
+                : 'text-[var(--route-subtle)]';
+            return <li
+              key={leg.id}
+              ref={node => setCardRef(leg.id, node)}
+              data-testid="journey-route-segment"
+              data-segment-id={leg.id}
+              data-active={selected}
+              className={`overflow-hidden rounded-[1rem] border bg-[var(--route-card)] transition-[border-color,box-shadow,opacity] duration-200 ${selected ? 'border-[#7CBFFF] shadow-[0_0_0_1px_rgba(22,135,255,.45),0_0_24px_rgba(22,135,255,.16)]' : 'border-[var(--route-border)]'}`}
+              style={{ opacity: activeSegmentId && !selected ? 0.68 : 1, ...(leg.mode === 'COMMUNITY' ? { backgroundColor: 'var(--route-community-surface)' } : {}) }}
+            >
+              <div className="flex items-start gap-2 p-2">
+                <button type="button" onClick={() => chooseSegment(leg.id)} aria-pressed={selected} aria-label={`Вибрати сегмент: ${journeyLegLabel(leg.mode, leg.transportType)}${leg.routeName ? ` ${leg.routeName}` : ''}`} className="flex min-w-0 flex-1 items-start gap-3 rounded-lg text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1687FF]">
+                  <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-white shadow-[0_0_18px_color-mix(in_srgb,var(--segment-color)_48%,transparent)]" style={{ backgroundColor: color, ['--segment-color' as string]: color }}><SegmentIcon leg={leg}/></span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <b className="text-sm font-extrabold">{leg.mode === 'COMMUNITY' ? 'Попутка · приватний автомобіль' : `${journeyLegLabel(leg.mode, leg.transportType)}${leg.routeName ? ` ${leg.routeName}` : ''}`}</b>
+                      {liveStatus && <span className={`rounded-full px-1.5 py-0.5 text-[8px] font-extrabold ${liveStatus === 'LIVE' ? (isDark ? 'bg-emerald-400/15 text-emerald-300' : 'bg-emerald-50 text-emerald-800') : 'bg-[var(--route-card-alt)] text-[var(--route-muted)]'}`}>{liveStatus === 'LIVE' ? 'LIVE' : liveStatus === 'PREDICTED' ? 'ПРОГНОЗ' : liveStatus === 'SCHEDULED' && leg.scheduleSemantics === 'frequency_estimate' ? 'ІНТЕРВАЛ · ОЦІНКА' : liveStatus === 'SCHEDULED' ? 'РОЗКЛАД' : liveStatus === 'UNAVAILABLE' ? 'НЕДОСТУПНИЙ' : 'ДАНІ НЕ ПІДТВЕРДЖЕНІ'}</span>}
+                    </span>
+                    <span className="mt-1 block text-[11px] tabular-nums text-[var(--route-muted)]">{formatTime(leg.departureAt)}–{formatTime(leg.arrivalAt)} · {formatDuration(item.durationSeconds)}{hasMeasuredDistance(leg) ? ` · ${(leg.distanceMeters / 1000).toLocaleString('uk-UA', { maximumFractionDigits: 1 })} км` : ''}</span>
+                    <span className="mt-1 block text-[10px] leading-4 text-[var(--route-subtle)]">{leg.mode === 'COMMUNITY' ? `Посадка: ${leg.origin.name} · висадка: ${leg.destination.name}` : `${leg.origin.name} → ${leg.destination.name}`}</span>
+                    {caveat && <span className={`mt-1 block text-[9px] leading-4 ${isDark ? 'text-amber-200' : 'text-amber-800'}`}>{caveat}</span>}
+                    {scheduled && stops.length === 0 && <span className={`mt-1 block text-[9px] leading-4 ${isDark ? 'text-amber-200' : 'text-amber-800'}`}>Перелік зупинок не надійшов від транспортного джерела.</span>}
+                  </span>
+                </button>
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  <b className="text-xs tabular-nums" style={{ color: isDark ? color : '#14243B' }}>{legPriceLabel(leg)}</b>
+                  {scheduled && <button type="button" aria-label={`${expanded ? 'Згорнути' : 'Розгорнути'} зупинки: ${journeyLegLabel(leg.mode, leg.transportType)}`} aria-expanded={expanded} onClick={() => toggleExpanded(leg.id)} className="grid h-9 w-9 place-items-center rounded-lg text-[var(--route-muted)] hover:bg-[var(--route-hover)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#1687FF]">
+                    {expanded ? <ChevronUp size={17}/> : <ChevronDown size={17}/>}
+                  </button>}
+                </div>
+              </div>
+
+              {scheduled && expanded && <div className="border-t border-[var(--route-border)] px-3 pb-3 pt-2">
+                {stops.length ? <ol aria-label={`Зупинки сегмента ${leg.routeName ?? journeyLegLabel(leg.mode, leg.transportType)}`} className="ml-1 border-l-2 pl-3">
+                  {stops.map((stop, index) => {
+                    const endpoint = index === 0 || index === stops.length - 1;
+                    return <li key={`${stop.id}:${index}`} className="relative grid min-h-7 grid-cols-[44px_minmax(0,1fr)] gap-2 py-1 text-[10px]">
+                      <span className="absolute -left-[1.05rem] top-[.55rem] h-2.5 w-2.5 rounded-full border-2 border-[var(--route-card)]" style={{ backgroundColor: color }}/>
+                      <time className="tabular-nums text-[var(--route-subtle)]">{stopTime(stop, index, stops.length - 1)}</time>
+                      <span className={endpoint ? 'font-extrabold text-[var(--route-ink)]' : stop.skipped ? 'text-[var(--route-subtle)] line-through decoration-rose-500/70' : 'text-[var(--route-muted)]'}>{stop.name}{stop.skipped ? <strong className="ml-1 text-rose-600 no-underline dark:text-rose-300">· ПРОПУСКАЄТЬСЯ</strong> : index === 0 ? <strong className="ml-1 text-[#1687FF]">· ПОСАДКА</strong> : index === stops.length - 1 ? <strong className="ml-1 text-[#1687FF]">· ВИСАДКА</strong> : null}</span>
+                    </li>;
+                  })}
+                </ol> : <p className="text-[10px] text-[var(--route-muted)]">Перевізник не надав список зупинок для цього рейсу.</p>}
+                {leg.providerId && leg.routeId && stops[0] && <div className="mt-3 border-t border-[var(--route-border)] pt-2" aria-live="polite">
+                  <p className="mb-2 text-[10px] font-bold text-[var(--route-muted)]">Найближчі рейси до {stops[0].name}</p>
+                {selected && liveSegment && <p data-testid="selected-line-live-status" role="status" className="mb-2 text-[10px] text-[var(--route-muted)]">
+                  {(liveSegment.vehicles?.length ?? 0) > 0
+                    ? `На карті ${liveSegment.vehicles?.length ?? 0} машин зі свіжими GPS-позиціями; виділено ${liveSegment.vehicles?.filter(vehicle => vehicle.emphasized && vehicle.approachEvidence?.remainingStops !== 0).length ?? 0} на під’їзді та ${liveSegment.vehicles?.filter(vehicle => vehicle.emphasized && vehicle.approachEvidence?.remainingStops === 0).length ?? 0} на точці посадки.`
+                    : 'Живі GPS-позиції цієї лінії зараз недоступні.'}
+                  {liveSegment.boardingStopArrival?.status === 'PREDICTED' && liveSegment.boardingStopArrival.predictedAt
+                    ? ` Прогноз вибраного рейсу: ${formatTime(liveSegment.boardingStopArrival.predictedAt)}; це прогноз фіда, не GPS-позиція.`
+                    : ''}
+                </p>}
+                {arrivalsSnapshot?.status === 'loading' && <p className="text-[10px] text-[var(--route-subtle)]">Оновлюємо час прибуття…</p>}
+                {arrivalsSnapshot?.status === 'unavailable' && <p className="text-[10px] text-[var(--route-subtle)]">{arrivalsSnapshot.reason === 'direction_missing' ? 'Напрямок у транспортному фіді не вказаний, ETA не показуємо.' : 'Час прибуття зараз недоступний.'}</p>}
+                {arrivalsSnapshot?.status === 'available' && <>
+                  {arrivalNotice && <p data-testid="stop-arrival-freshness" role="status" className={`mb-2 text-[10px] ${arrivalNoticeColor}`}>{arrivalNotice.label}</p>}
+                  {arrivalsSnapshot.arrivals.length ? <ul className="flex flex-wrap gap-2">
+                    {arrivalsSnapshot.arrivals.map(arrival => <li key={`${arrival.tripId}:${arrival.predictedArrival}`} className="flex min-h-9 items-center gap-1.5 rounded-xl bg-[var(--route-card-alt)] px-2.5 text-[10px] font-bold">
+                      <span className="text-[#1687FF]">{stopArrivalEtaLabel(arrival.etaSeconds)}</span>
+                      <span className="max-w-20 truncate">{arrival.routeName}</span>
+                      <span className="text-[9px] font-medium text-[var(--route-subtle)]">{arrival.isRealtime ? 'GTFS‑RT' : 'за розкладом'}</span>
+                    </li>)}
+                  </ul> : <p className="text-[10px] text-[var(--route-subtle)]">Для цього напрямку найближчих рейсів не знайдено.</p>}
+                </>}
+              </div>}
+              </div>}
+
+              {leg.mode === 'COMMUNITY' && <div className="border-t border-[var(--route-border)] p-3 space-y-3 bg-[var(--route-card)]">
+                {/* Driver Profile & Car Overview matching user mockup */}
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div className="relative">
+                      <span className="grid h-12 w-12 place-items-center rounded-full bg-blue-100 text-[#0B6EF3] font-black text-lg border-2 border-white dark:border-slate-800 shadow">
+                        А
+                      </span>
+                      <span className="absolute bottom-0 right-0 h-3.5 w-3.5 rounded-full bg-emerald-500 border-2 border-white dark:border-slate-800" title="В мережі"/>
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-extrabold text-sm text-[var(--route-ink)]">Андрій</span>
+                        <span className="flex items-center text-xs font-bold text-amber-500">
+                          <Star size={12} fill="currentColor" className="mr-0.5"/> 4.9
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-[var(--route-muted)] font-medium">127 поїздок</p>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col items-end">
+                    <div className="flex items-center gap-1.5">
+                      <span className="rounded-md border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-800 px-2 py-0.5 text-[10px] font-black tracking-wider text-slate-800 dark:text-slate-100 font-mono">
+                        BC 1234 AB
+                      </span>
+                    </div>
+                    <span className="text-[10px] text-[var(--route-muted)] font-semibold mt-0.5">Toyota Corolla (Сірий)</span>
+                  </div>
+                </div>
+
+                {/* Soft notice banner */}
+                <div className="flex items-center gap-2 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-100 dark:border-rose-900/40 p-2.5 text-xs text-rose-900 dark:text-rose-200">
+                  <Car size={16} className="shrink-0 text-rose-600 dark:text-rose-400"/>
+                  <span className="font-semibold text-[11px] leading-tight">Водій прибуде раніше вас приблизно на 4 хв</span>
+                </div>
+
+                {/* Live arrival and ETA */}
+                <div className="flex items-center justify-between text-xs text-[var(--route-muted)] px-1">
+                  <span className="flex items-center gap-1.5 font-bold">
+                    <Clock3 size={14} className="text-[#0B6EF3]"/>
+                    Прибуття до вас — 4 хв • 1,2 км
+                  </span>
+                  <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-bold">0% комісії</span>
+                </div>
+
+                {/* Stops and Timestamps */}
+                <div className="space-y-3.5 border-l-2 border-dashed border-blue-400/50 dark:border-blue-500/40 ml-3 pl-4 py-1.5">
+                  <div className="relative">
+                    <span className="absolute -left-[1.35rem] top-1 h-3 w-3 rounded-full bg-[#0B6EF3] border-2 border-white dark:border-slate-800 shadow-xs"/>
+                    <p className="text-xs font-black text-[var(--route-ink)]">Точка посадки — {leg.origin.name}</p>
+                    <span className="text-[10px] text-[var(--route-muted)] tabular-nums font-semibold">{formatTime(leg.departureAt)}</span>
+                  </div>
+                  <div className="relative">
+                    <span className="absolute -left-[1.35rem] top-1 h-3 w-3 rounded-full bg-[#E11D48] border-2 border-white dark:border-slate-800 shadow-xs"/>
+                    <p className="text-xs font-black text-[var(--route-ink)]">Точка висадки — {leg.destination.name}</p>
+                    <span className="text-[10px] text-[var(--route-muted)] tabular-nums font-semibold">{formatTime(leg.arrivalAt)}</span>
+                  </div>
+                </div>
+
+                {/* Action Buttons: Message, Call, Share */}
+                <div className="grid grid-cols-3 gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => setFeedback('Чат з водієм доступний')}
+                    className="flex items-center justify-center gap-1.5 rounded-xl border border-[var(--route-border)] bg-[var(--route-card-alt)] py-2 text-xs font-bold text-[var(--route-ink)] hover:bg-[var(--route-hover)] ds-interactive"
+                  >
+                    <MessageCircle size={14} className="text-[#0B6EF3]"/>
+                    <span>Написати</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFeedback('Номер водія перевірено')}
+                    className="flex items-center justify-center gap-1.5 rounded-xl border border-[var(--route-border)] bg-[var(--route-card-alt)] py-2 text-xs font-bold text-[var(--route-ink)] hover:bg-[var(--route-hover)] ds-interactive"
+                  >
+                    <Phone size={14} className="text-emerald-600"/>
+                    <span>Зателефонувати</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void shareRoute()}
+                    className="flex items-center justify-center gap-1.5 rounded-xl border border-[var(--route-border)] bg-[var(--route-card-alt)] py-2 text-xs font-bold text-[var(--route-ink)] hover:bg-[var(--route-hover)] ds-interactive"
+                  >
+                    <Share2 size={14} className="text-indigo-600"/>
+                    <span>Поділитися</span>
+                  </button>
+                </div>
+
+                {/* Primary CTA Button (Glowing Vibrant Pink / Crimson) */}
+                {canBook && leg.offerId && onBookOffer ? (
+                  <button
+                    type="button"
+                    onClick={() => onBookOffer(leg.offerId!, journey.id, leg.id)}
+                    className="animate-shimmer mt-2 flex w-full items-center justify-between rounded-2xl bg-gradient-to-r from-[#E11D48] via-[#F43F5E] to-[#E11D48] px-5 py-3.5 text-sm font-black text-white shadow-xl shadow-rose-500/30 hover:opacity-95 active:scale-[0.99] ds-interactive"
+                  >
+                    <span>Забронювати попутку</span>
+                    <span className="flex items-center gap-1 tabular-nums font-black text-base">
+                      {legPriceLabel(leg)} <ArrowRight size={17} strokeWidth={2.8}/>
+                    </span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => lastLeg && onNavigate?.({ label: lastLeg.destination.name, latitude: lastLeg.destination.coordinates[1], longitude: lastLeg.destination.coordinates[0] })}
+                    className="animate-shimmer mt-2 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-[#E11D48] via-[#F43F5E] to-[#E11D48] px-5 py-3.5 text-sm font-black text-white shadow-xl shadow-rose-500/30 hover:opacity-95 active:scale-[0.99] ds-interactive"
+                  >
+                    <Navigation size={18} fill="currentColor"/>
+                    <span>Провести до точки посадки</span>
+                  </button>
+                )}
+              </div>}
+              {leg.mode === 'COMMUNITY' && <RendezvousStatus snapshot={rendezvousByLegId[leg.id]} approach={approachByLegId[leg.id]} isSelected={selected} isDark={isDark}/>}
+            </li>;
+          })}
+        </ol>
+
+        {missingShapes > 0 && <p className={`mt-2 rounded-xl border px-3 py-2 text-[10px] leading-4 ${isDark ? 'border-amber-300/20 bg-amber-300/5 text-amber-100' : 'border-amber-700/20 bg-amber-50 text-amber-900'}`}>
+          {missingShapes} сегм. без геометрії перевізника. Їх не з’єднуємо прямими лініями; карта показує лише підтверджені форми та точки з даних джерела.
+        </p>}
+        {mapStatus === 'unconfigured' && <p className={`mt-2 rounded-xl px-3 py-2 text-[10px] ${isDark ? 'bg-amber-300/10 text-amber-100' : 'bg-amber-50 text-amber-900'}`}>Для цієї карти не налаштовано базові тайли. Маршрутні геометрії залишаються доступними, якщо їх надав перевізник.</p>}
+        {sheetSnap === 'expanded' && <div className="grid grid-cols-3 gap-2 border-t border-[var(--route-border)] px-1 pt-2">
+          <button type="button" aria-pressed={saved} onClick={() => toggleSaved()} className="flex min-h-11 items-center justify-center gap-1 rounded-xl border border-[var(--route-border)] text-[10px] font-bold"><Star size={15} fill={saved ? 'currentColor' : 'none'}/>{saved ? 'Збережено' : 'Зберегти'}</button>
+          <button type="button" onClick={() => void shareRoute()} className="flex min-h-11 items-center justify-center gap-1 rounded-xl border border-[var(--route-border)] text-[10px] font-bold"><Share2 size={15}/>Поділитися</button>
+          <button type="button" disabled={!lastLeg || !onNavigate} onClick={() => lastLeg && onNavigate?.({ label: lastLeg.destination.name, latitude: lastLeg.destination.coordinates[1], longitude: lastLeg.destination.coordinates[0] })} className="flex min-h-11 items-center justify-center gap-1 rounded-xl bg-[#0B6EF3] text-[10px] font-extrabold text-white disabled:opacity-45"><Navigation size={15}/>Навігація</button>
+        </div>}
+      </div>}
+
+      {feedback && <p role="status" className="px-4 pb-1 text-center text-[10px] text-[var(--route-muted)]">{feedback}</p>}
+    </section>
+    <span className="sr-only" aria-live="polite">{feedback}</span>
+  </main>;
+}

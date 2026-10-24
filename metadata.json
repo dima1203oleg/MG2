@@ -1,0 +1,6 @@
+{
+  "name": "MARSHGO — Мультимодальна навігація та попутки",
+  "description": "Повноцінний транспортний маркетплейс та інтелектуальна мультимодальна навігаційна платформа України: пошук, планування, комбінування, бронювання поїздок, громадський транспорт, попутки (0% комісії) та MarshPass.",
+  "requestFramePermissions": ["geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

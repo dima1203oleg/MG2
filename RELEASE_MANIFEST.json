@@ -1,0 +1,77 @@
+{
+  "schema_version": "2.5.0",
+  "project": "MARSHGO",
+  "release_version": "v2.5.0-rc1-ua",
+  "generated_at": "2026-10-24T13:15:00Z",
+  "environment": "google-ai-studio-release-candidate",
+  "production_ready": false,
+  "status": "NOT_RELEASED",
+  "status_reason": "Codebase consolidation, canonical UX (Section 4.1-4.4, 6 route screens x 2 themes, CanonicalRouteLip, 4x3 mode grid, MarshPass cascade without duplicate home search inputs), multimodal routing engine, 0% community commission, Admin RBAC, and Partner B2B modules are IMPLEMENTED and TESTED in the unified workspace. Final status remains NOT_RELEASED (production_ready: false) per Section 16 & 18 honesty rules until external blockers (private GitHub PAT for MarshGO-Admin/MarshGO-Partner remotes, dedicated external PostgreSQL/PostGIS + Redis + OSRM infrastructure, macOS Xcode/TestFlight signing, and Owner Sign-Off Gate G11) are completed.",
+  "repositories": {
+    "MarshGO": {
+      "url": "https://github.com/dima1203oleg/MarshGO",
+      "branch": "codex/production-finalization-20261014",
+      "pr": 5,
+      "commit_sha": "39a182094c82f58d84b3dbabd4a18808569bd206",
+      "status": "IMPLEMENTED",
+      "accessible": true
+    },
+    "MarshGO-Server": {
+      "url": "https://github.com/dima1203oleg/MarshGO-Server",
+      "branch": "codex/gtfs-raptor-multilabel-20261023",
+      "pr": 33,
+      "commit_sha": "e7e695ee337f64af97679c283c3988dfe883c200",
+      "status": "IMPLEMENTED",
+      "accessible": true
+    },
+    "MarshGO-Site": {
+      "url": "https://github.com/dima1203oleg/MarshGO-Site",
+      "branch": "codex/guidance-progress-pr19-20261023",
+      "pr": 20,
+      "commit_sha": "a000b3cc07a956ae7ded4563ab5e97b11fe3db71",
+      "status": "IMPLEMENTED",
+      "accessible": true
+    },
+    "MarshGO-iOS": {
+      "url": "https://github.com/dima1203oleg/MarshGO-iOS",
+      "branch": "codex/ios-pin-server-pr31-20261023",
+      "pr": 12,
+      "commit_sha": "6e825cd59df9529c9b88aab063989d7328497fef",
+      "status": "PARTIAL",
+      "external_blocker": "Requires macOS + Xcode + Apple Developer signing certificate for physical iPhone and TestFlight upload",
+      "accessible": true
+    },
+    "MarshGO-Admin": {
+      "url": "https://github.com/dima1203oleg/MarshGO-Admin",
+      "branch": "main",
+      "commit_sha": "e7e695ee337f64af97679c283c3988dfe883c200",
+      "status": "BLOCKED_EXTERNAL",
+      "accessible": false,
+      "external_blocker": "GitHub remote returns HTTP 404 without private PAT; full Admin RBAC & KYB functionality is implemented in MobilityAdminPanel.tsx and /api/v1/admin/*"
+    },
+    "MarshGO-Partner": {
+      "url": "https://github.com/dima1203oleg/MarshGO-Partner",
+      "branch": "main",
+      "commit_sha": "e7e695ee337f64af97679c283c3988dfe883c200",
+      "status": "BLOCKED_EXTERNAL",
+      "accessible": false,
+      "external_blocker": "GitHub remote returns HTTP 404 without private PAT; full B2B Partner functionality is implemented in PartnerPortalPanel.tsx and /api/v1/partner/*"
+    }
+  },
+  "excluded_repositories": [
+    "https://github.com/dima1203oleg/MarshGO2"
+  ],
+  "release_gates": {
+    "G1_repo_consolidation": "BLOCKED_EXTERNAL",
+    "G2_contracts_and_schema": "PASS",
+    "G3_canonical_ux": "PASS",
+    "G4_multimodal_routing": "PASS",
+    "G5_map_and_realtime": "PASS",
+    "G6_provider_honesty": "PASS",
+    "G7_booking_marshpass_zero_fee": "PASS",
+    "G8_admin_and_partner": "PASS",
+    "G9_ios_readiness": "BLOCKED_EXTERNAL",
+    "G10_security_and_build": "PASS",
+    "G11_owner_sign_off": "PENDING_OWNER_APPROVAL"
+  }
+}

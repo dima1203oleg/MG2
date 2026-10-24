@@ -1,0 +1,15 @@
+node_modules/
+build/
+dist/
+coverage/
+/data/
+MARSHGO-WORKSPACE/
+.aistudio/
+/public/assets/aistudio/
+.DS_Store
+*.log
+*.tsbuildinfo
+.env*
+!.env.example
+
+

@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="uk">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>MARSHGO — Мультимодальна навігація та транспортний маркетплейс</title>
+    <meta name="description" content="Повноцінний транспортний маркетплейс та інтелектуальна мультимодальна навігаційна платформа України: пошук, планування, комбінування, бронювання поїздок і живий супровід маршрутів." />
+    <meta property="og:title" content="MARSHGO — Мультимодальна навігація та попутки" />
+    <meta property="og:description" content="Повноцінний транспортний маркетплейс та інтелектуальна мультимодальна навігаційна платформа України: пошук, планування, комбінування, бронювання поїздок, громадський транспорт, попутки (0% комісії) та MarshPass." />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="MARSHGO" />
+    <meta property="og:locale" content="uk_UA" />
+    <meta property="og:image" content="/hero_car_route.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="MARSHGO — Мультимодальна навігація та попутки" />
+    <meta name="twitter:description" content="Повноцінний транспортний маркетплейс та інтелектуальна мультимодальна навігаційна платформа України: пошук, планування, комбінування, бронювання поїздок, громадський транспорт, попутки (0% комісії) та MarshPass." />
+    <meta name="twitter:image" content="/hero_car_route.png" />
+    <meta name="theme-color" content="#081B35" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="MARSHGO" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..700&family=JetBrains+Mono:wght@500;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "MARSHGO",
+        "alternateName": "MARSHGO — Мультимодальна навігація та попутки",
+        "applicationCategory": "TravelApplication",
+        "operatingSystem": "Web, iOS, Android",
+        "inLanguage": "uk-UA",
+        "description": "Повноцінний транспортний маркетплейс та інтелектуальна мультимодальна навігаційна платформа України: пошук, планування, комбінування, бронювання поїздок, громадський транспорт, попутки (0% комісії) та MarshPass.",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "UAH"
+        }
+      }
+    </script>
+    <script>
+      // AI Studio Runtime: HMR is disabled.
+      // Stub Vite's internal HMR WebSocket connection so @vite/client does not attempt to
+      // connect to unreachable internal ports (24678) or trigger "WebSocket closed without opened" errors.
+      (function() {
+        var OrigWS = window.WebSocket;
+        if (!OrigWS) return;
+        window.WebSocket = function(url, protocols) {
+          var urlStr = String(url || '');
+          var isViteHmr = (Array.isArray(protocols) && protocols.includes('vite-hmr')) ||
+                          protocols === 'vite-hmr' ||
+                          urlStr.includes(':24678') ||
+                          (urlStr.includes('vite') && !urlStr.includes('/api/v1/realtime'));
+          if (isViteHmr) {
+            var target = new EventTarget();
+            target.binaryType = 'blob';
+            target.readyState = 1; // WebSocket.OPEN
+            target.url = urlStr;
+            target.protocol = 'vite-hmr';
+            target.extensions = '';
+            target.bufferedAmount = 0;
+            target.send = function() {};
+            target.close = function() {};
+            target.addEventListener = EventTarget.prototype.addEventListener.bind(target);
+            target.removeEventListener = EventTarget.prototype.removeEventListener.bind(target);
+            target.dispatchEvent = EventTarget.prototype.dispatchEvent.bind(target);
+            setTimeout(function() {
+              target.dispatchEvent(new Event('open'));
+            }, 0);
+            return target;
+          }
+          return new OrigWS(url, protocols);
+        };
+        window.WebSocket.prototype = OrigWS.prototype;
+        window.WebSocket.CONNECTING = OrigWS.CONNECTING;
+        window.WebSocket.OPEN = OrigWS.OPEN;
+        window.WebSocket.CLOSING = OrigWS.CLOSING;
+        window.WebSocket.CLOSED = OrigWS.CLOSED;
+      })();
+    </script>
+  </head>
+  <body class="bg-[#F5F8FD] text-[#14243B] antialiased selection:bg-[#1769F4] selection:text-white">
+    <div id="root"><main style="min-height:100vh;display:grid;place-items:center;background:#f3f7fc;color:#14243b;font:600 16px system-ui,sans-serif">Відкриваємо MARSHGO…</main></div>
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').then((reg) => {
+            reg.update().catch(() => undefined);
+          }).catch(() => undefined);
+        });
+      }
+
+      function isIgnorableViteError(sourceOrStack) {
+        const text = String(sourceOrStack || '');
+        return text.includes('@vite/client') || text.includes('WebSocket') || text.includes('vite') || text.includes('24678') || text.includes('ws:');
+      }
+
+      function showBootFailure(message) {
+        const root = document.getElementById('root');
+        if (!root || window.__MARSHGO_BOOTED__) return;
+
+        const main = document.createElement('main');
+        main.setAttribute('role', 'alert');
+        main.style.cssText = 'min-height:100vh;display:grid;place-items:center;padding:24px;background:#f3f7fc;color:#14243b;font:600 16px system-ui,sans-serif;text-align:center';
+
+        const section = document.createElement('section');
+        section.style.cssText = 'width:min(100%,420px);display:grid;justify-items:center;gap:16px';
+        const text = document.createElement('p');
+        text.textContent = message;
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.textContent = 'Спробувати ще раз';
+        retry.style.cssText = 'min-height:48px;border:0;border-radius:16px;padding:12px 24px;background:#1769f4;color:white;font:700 16px system-ui,sans-serif;cursor:pointer';
+        retry.addEventListener('click', () => window.location.reload());
+        section.append(text, retry);
+        main.append(section);
+        root.replaceChildren(main);
+      }
+
+      window.addEventListener('error', (event) => {
+        const source = (event?.filename || '') + ' ' + (event?.message || '') + ' ' + (event?.error?.stack || '');
+        if (isIgnorableViteError(source) || (typeof WebSocket !== 'undefined' && event?.target instanceof WebSocket)) {
+          event.preventDefault();
+          event.stopImmediatePropagation?.();
+          return;
+        }
+        showBootFailure('Не вдалося завантажити MARSHGO. Перевірте з’єднання й спробуйте ще раз.');
+      }, true);
+      window.addEventListener('unhandledrejection', (event) => {
+        const reason = event?.reason;
+        const stack = (reason && (reason.stack || reason.message)) || String(reason || '');
+        if (isIgnorableViteError(stack)) {
+          event.preventDefault();
+          event.stopImmediatePropagation?.();
+          return;
+        }
+        showBootFailure('Виникла помилка запуску MARSHGO. Перевірте з’єднання й спробуйте ще раз.');
+      }, true);
+      window.setTimeout(() => {
+        if (window.__MARSHGO_BOOTED__) return;
+        showBootFailure('MARSHGO завантажується надто довго. Перевірте з’єднання й спробуйте ще раз.');
+      }, 15000);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
